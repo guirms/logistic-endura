@@ -1,0 +1,2 @@
+## Create .exe
+pyinstaller --onedir --windowed --name ScannerPedidos .\main.py
