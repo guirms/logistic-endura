@@ -205,6 +205,26 @@ def montar_payload(dados: dict) -> dict:
 
 
 def enviar_pedido(payload: dict) -> dict:
+    # ── MOCK para testes — remover em produção ──
+    import random
+    fake_bill = "MOCK" + "".join(random.choices(string.digits, k=11))
+    return {
+        "code": "1",
+        "msg": "success",
+        "data": {
+            "lastCenterName": "DC BAU-SP",
+            "sortingCode": "BAU  413-00  002",
+            "createOrderTime": "2026-06-05 10:00:00",
+            "orderList": [
+                {
+                    "txlogisticId": payload["TxlogisticId"],
+                    "billCode": fake_bill,
+                }
+            ],
+        },
+    }
+    # ── fim do MOCK ──
+    
     biz_content_str = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
     digest          = gerar_digest(biz_content_str)
     timestamp       = get_timestamp()
@@ -288,8 +308,8 @@ def carregar_mapa_bill_code(sucessos: list) -> dict:
 
 
 def atualizar_tracking_code(subscription_id: str, bill_code: str) -> None:
-    sql = 'UPDATE "Subscriptions" SET "TrackingCode" = %(tracking_code)s WHERE "Id" = %(subscription_id)s'
-    print(f"SQL: {sql}")
+    sql = 'UPDATE "Subscriptions" SET "TrackingCode" = %(tracking_code)s, "UpdatedAt" = NOW() WHERE "Id" = %(subscription_id)s'
+    print(f"SQL: {sql} {subscription_id}, {bill_code}")
     try:
         conn = psycopg2.connect(host=DB_HOST, port=DB_PORT, dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD)
         try:
@@ -431,6 +451,12 @@ def main():
                         print(f"\n    ⚠️  Não foi possível extrair billCode da resposta: {exc}")
 
                     print(f"✅  TxlogisticId: {payload['TxlogisticId']} | NF: {pai_dados['nNF']} | {pai_dados['dest']['Name']}")
+
+                    sub_id_pai = mapa_subscriptions.get(pai_dados["chNFe"])
+                    if sub_id_pai and bill_code_existente:
+                        atualizar_tracking_code(sub_id_pai, bill_code_existente)
+                    else:
+                        print(f"    ⚠️  Subscription não encontrada para o pai chNFe {pai_dados['chNFe'][:20]}...")
 
                     sucessos.append(entrada_log)
                     ja_feitos.add(pai_dados["chNFe"])
