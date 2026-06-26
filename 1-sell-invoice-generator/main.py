@@ -190,44 +190,6 @@ def load_processed_ids() -> set:
 # ── Database ───────────────────────────────────────────────────────────────────
 
 def fetch_subscriptions() -> list[dict]:
-    # sql = """
-    #     SELECT
-    #         s."Id"               AS "SubscriptionId",
-    #         s."AdditionalInfo"   AS "AdditionalInfo",
-    #         e."Name"             AS "EventName",
-    #         u."Name"             AS "CustomerName",
-    #         u."Cpf"              AS "CustomerCpf",
-    #         u."Phone"            AS "CustomerPhone",
-    #         a."Street"           AS "CustomerStreet",
-    #         a."HouseNumber"      AS "CustomerHouseNumber",
-    #         a."Neighborhood"     AS "CustomerNeighborhood",
-    #         a."City"             AS "CustomerCity",
-    #         a."State"            AS "CustomerUf",
-    #         a."ZipCode"          AS "CustomerCep",
-    #         k."Price"            AS "KitPrice",
-    #         k."Name"             AS "KitName",
-    #         p."Price"            AS "TotalPrice",
-    #         p."Type"             AS "PaymentType",
-    #         kob."Name"           AS "OrderBumpKitName",
-    #         kob."Price"          AS "OrderBumpKitPrice",
-    #         eob."Name"           AS "OrderBumpEventName"
-    #     FROM "Subscriptions" s
-    #     JOIN "Payments"   p ON p."Id" = s."PaymentId"
-    #     JOIN "Users"      u ON u."Id" = s."UserId"
-    #     JOIN "Checkouts"  c ON c."Id" = s."CheckoutId"
-    #     JOIN "Kits"       k ON k."Id" = c."KitId"
-    #     JOIN "Events"     e ON e."Id" = k."EventId"
-    #     join "ShippingQuotes" sq on sq."CheckoutId" = c."Id"
-    #     JOIN "Addressess" a ON a."Id" = sq."AddressId"
-    #     LEFT JOIN "OrderBumps" o   ON c."Id" = o."CheckoutId"
-    #     LEFT JOIN "Kits"       kob ON o."KitId" = kob."Id"
-    #     LEFT JOIN "Events"     eob ON eob."Id" = kob."EventId"
-    #     WHERE COALESCE(s."UpdatedAt", s."CreatedAt") > %(created_after)s
-    #     AND NOT (a."ZipCode" = '88804600' or a."ZipCode" = '88805090')
-    #     AND p."Status" = 1
-    #     ORDER BY s."Id";
-    # """
-    
     sql = """
         SELECT
             s."Id"               AS "SubscriptionId",
@@ -244,10 +206,11 @@ def fetch_subscriptions() -> list[dict]:
             a."ZipCode"          AS "CustomerCep",
             k."Price"            AS "KitPrice",
             k."Name"             AS "KitName",
+            c."SubscriptionQuantity" AS "SubscriptionQuantity",
             p."Price"            AS "TotalPrice",
             p."Type"             AS "PaymentType",
             kob."Name"           AS "OrderBumpKitName",
-            kob."Price"          AS "OrderBumpKitPrice",
+            o."Price"          AS "OrderBumpKitPrice",
             eob."Name"           AS "OrderBumpEventName"
         FROM "Subscriptions" s
         JOIN "Payments"   p ON p."Id" = s."PaymentId"
@@ -261,7 +224,8 @@ def fetch_subscriptions() -> list[dict]:
         LEFT JOIN "Kits"       kob ON o."KitId" = kob."Id"
         LEFT JOIN "Events"     eob ON eob."Id" = kob."EventId"
         WHERE COALESCE(s."UpdatedAt", s."CreatedAt") > %(created_after)s
-        AND NOT (a."ZipCode" = '88804600' or a."ZipCode" = '88805090')        
+        AND NOT (a."ZipCode" = '88804600' or a."ZipCode" = '88805090')   
+        AND p."Status" = 1     
         ORDER BY s."Id";
     """
     
@@ -346,14 +310,14 @@ def build_item_description(
     return " - ".join(parts)
 
 
-def get_package_weight(has_order_bump: bool, has_additional_info: bool) -> float:
+def get_package_weight(quantity: int, has_order_bump: bool, has_additional_info: bool) -> float:
     """
     Returns the package weight in kg.
-    Base: 0.250 kg
+    Base: 0.250 kg por unidade do kit principal (quantity)
     + 0.250 kg if there is an order bump
     + 0.250 kg if there is additional info
     """
-    base_weight = 0.250
+    base_weight = 0.250 * quantity
     extra = (0.250 if has_order_bump else 0) + (0.250 if has_additional_info else 0)
     return round(base_weight + extra, 3)
 
@@ -363,6 +327,7 @@ def get_package_weight(has_order_bump: bool, has_additional_info: bool) -> float
 def build_nfce_body(row: dict) -> dict:
     valor_kit_principal = float(row["KitPrice"])
     valor_total = float(row["TotalPrice"])
+    subscription_quantity = int(row.get("SubscriptionQuantity") or 1)
     order_bump_names: list[str] = row.get("OrderBumpKitNames", [])
     order_bump_prices: list[float] = row.get("OrderBumpKitPrices", [])
     additional_info: str | None = row.get("AdditionalInfo")
@@ -370,9 +335,9 @@ def build_nfce_body(row: dict) -> dict:
 
     order_bump_event_names: list[str | None] = row.get("OrderBumpEventNames", [])
 
-    # Sum of all kit prices (main + order bumps)
+    # Sum of all kit prices (main + order bumps), considerando a quantidade do kit principal
     valor_order_bumps = sum(order_bump_prices)
-    valor_produtos = round(valor_kit_principal + valor_order_bumps, 2)
+    valor_produtos = round(valor_kit_principal * subscription_quantity + valor_order_bumps, 2)
 
     # Discount is the difference between gross product value + freight and what was actually charged
     valor_desconto_header = round(valor_produtos - valor_total + VALOR_FRETE, 2)
@@ -389,12 +354,12 @@ def build_nfce_body(row: dict) -> dict:
             "codigo_ncm": ncm,
             "codigo_produto": codigo_produto,
             "descricao": descricao_principal,
-            "quantidade_comercial": 1,
-            "quantidade_tributavel": 1,
+            "quantidade_comercial": subscription_quantity,
+            "quantidade_tributavel": subscription_quantity,
             "cfop": "5102",
             "valor_unitario_comercial": valor_kit_principal,
             "valor_unitario_tributavel": valor_kit_principal,
-            "valor_bruto": valor_kit_principal,
+            "valor_bruto": round(valor_kit_principal * subscription_quantity, 2),
             "valor_frete": VALOR_FRETE,
             "valor_desconto": valor_desconto_header,
             "unidade_comercial": "un",
@@ -464,6 +429,7 @@ def build_nfce_body(row: dict) -> dict:
 def build_nfe_body(row: dict) -> dict:
     valor_kit_principal = float(row["KitPrice"])
     valor_total = float(row["TotalPrice"])
+    subscription_quantity = int(row.get("SubscriptionQuantity") or 1)
     order_bump_names: list[str] = row.get("OrderBumpKitNames", [])
     order_bump_prices: list[float] = row.get("OrderBumpKitPrices", [])
     additional_info: str | None = row.get("AdditionalInfo")
@@ -471,16 +437,16 @@ def build_nfe_body(row: dict) -> dict:
 
     order_bump_event_names: list[str | None] = row.get("OrderBumpEventNames", [])
 
-    # Sum of all kit prices (main + order bumps)
+    # Sum of all kit prices (main + order bumps), considerando a quantidade do kit principal
     valor_order_bumps = sum(order_bump_prices)
-    valor_produtos = round(valor_kit_principal + valor_order_bumps, 2)
+    valor_produtos = round(valor_kit_principal * subscription_quantity + valor_order_bumps, 2)
 
     valor_desconto_header = round(valor_produtos - valor_total + VALOR_FRETE, 2)
     ncm, codigo_produto = resolve_kit_fields(row["KitName"])
     emission_time = now_brt()
 
     has_additional_info = bool(additional_info and additional_info.strip())
-    peso = get_package_weight(has_order_bump, has_additional_info)
+    peso = get_package_weight(subscription_quantity, has_order_bump, has_additional_info)
     descricao_principal = build_item_description(row["KitName"], row["EventName"], order_bump_names, order_bump_event_names, additional_info)
 
     # Build items list — main kit always present
@@ -490,10 +456,10 @@ def build_nfe_body(row: dict) -> dict:
             "codigo_produto": codigo_produto,
             "descricao": descricao_principal,
             "cfop": "6102",
-            "quantidade_comercial": 1,
+            "quantidade_comercial": subscription_quantity,
             "valor_unitario_comercial": valor_kit_principal,
             "unidade_comercial": "UN",
-            "valor_bruto": valor_kit_principal,
+            "valor_bruto": round(valor_kit_principal * subscription_quantity, 2),
             "valor_frete": VALOR_FRETE,
             "valor_desconto": valor_desconto_header,
             "codigo_ncm": ncm,
