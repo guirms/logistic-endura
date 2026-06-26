@@ -22,13 +22,14 @@ import sys
 import json
 from datetime import datetime, timezone
 
+load_dotenv()
+
 def resource_path(relative_path=""):
     if getattr(sys, "frozen", False):
         return Path(sys.executable).parent / relative_path
     return Path(__file__).parent.resolve() / relative_path
 
 BASE_DIR = resource_path()
-load_dotenv(BASE_DIR / ".env")
 
 SUCCESS_FILE = BASE_DIR / "success_responses.json"
 ERROR_FILE   = BASE_DIR / "error_responses.json"
@@ -47,6 +48,7 @@ SQL = """
         e."Name"           AS "EventName",
         s."TShirtSize"     AS "TShirtSize",
         s."AdditionalInfo" AS "AdditionalInfo",
+        c."SubscriptionQuantity" AS "SubscriptionQuantity",
         kob."Name"         AS "OrderBumpKitName",
         kob."PngPicture"   AS "OrderBumpKitPngPicture",
         eob."Name"         AS "OrderBumpEventName"
@@ -262,7 +264,8 @@ class KitPanel(tk.Frame):
     _refs = []
 
     def __init__(self, parent, kit_name, img_path, tag_text, tag_fg, tag_bg,
-             event_name=None, is_main=False, index=None, tshirt="", **kw):
+             event_name=None, is_main=False, index=None, tshirt="", quantity="1", **kw):
+        quantity = str(quantity)
         super().__init__(parent, bg=SURFACE, bd=0,
                         highlightthickness=1, highlightbackground=BORDER, **kw)
 
@@ -315,6 +318,19 @@ class KitPanel(tk.Frame):
                     font=("Helvetica", 8, "bold")).pack(side="left", padx=(0, 8))
             tk.Label(ts_row, text=tshirt, bg=SURFACE, fg=INK,
                     font=("Helvetica", 22, "bold")).pack(side="left")
+            
+        qty_row = tk.Frame(right, bg=SURFACE)
+        qty_row.pack(anchor="w", pady=(10, 0))
+        tk.Label(qty_row, text="QUANTIDADE DE KITS", bg=SURFACE, fg=INK3,
+                font=("Helvetica", 8, "bold")).pack(side="left", padx=(0, 8))
+        qty_frame = tk.Frame(qty_row, bg=RED if int(quantity) > 1 else SURFACE,
+                            highlightthickness=2 if int(quantity) > 1 else 0,
+                            highlightbackground=RED)
+        qty_frame.pack(side="left")
+        tk.Label(qty_frame, text=quantity, bg=RED if int(quantity) > 1 else SURFACE,
+                fg=SURFACE if int(quantity) > 1 else INK,
+         font=("Helvetica", 22, "bold"),
+         padx=10 if int(quantity) > 1 else 0).pack()
 
         tk.Frame(right, bg=BORDER, height=1).pack(fill="x", pady=12)
 
@@ -572,6 +588,7 @@ class ScannerApp(tk.Tk):
             "img_path": str(row["KitPngPicture"] or ""),
             "event":    str(row["EventName"] or ""),
             "tshirt":   tshirt,          # ← novo
+            "quantity": str(row.get("SubscriptionQuantity") or "1"),
             "is_main":  True,
             "tag_text": "KIT PRINCIPAL",
             "tag_fg":   SURFACE,
@@ -586,6 +603,7 @@ class ScannerApp(tk.Tk):
                     "img_path": str(r["OrderBumpKitPngPicture"] or ""),
                     "event":    str(r["OrderBumpEventName"] or ""),
                     "tshirt":   tshirt,  # ← mesmo tamanho
+                    "quantity": "1",
                     "is_main":  False,
                     "tag_text": "ORDER BUMP",
                     "tag_fg":   ORANGE,
@@ -675,7 +693,8 @@ class ScannerApp(tk.Tk):
                 event_name=item["event"],
                 is_main=item["is_main"],
                 index=f"{idx} DE {total}",
-                tshirt=item["tshirt"],       # ← novo
+                tshirt=item["tshirt"], 
+                quantity=item["quantity"],                
             ).pack(fill="x", padx=28, pady=(12 if idx == 1 else 6, 0))
 
         # ── Informações adicionais (seção detalhada abaixo dos kits) ──────

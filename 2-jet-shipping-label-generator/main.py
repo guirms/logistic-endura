@@ -206,23 +206,23 @@ def montar_payload(dados: dict) -> dict:
 
 def enviar_pedido(payload: dict) -> dict:
     # ── MOCK para testes — remover em produção ──
-    import random
-    fake_bill = "MOCK" + "".join(random.choices(string.digits, k=11))
-    return {
-        "code": "1",
-        "msg": "success",
-        "data": {
-            "lastCenterName": "DC BAU-SP",
-            "sortingCode": "BAU  413-00  002",
-            "createOrderTime": "2026-06-05 10:00:00",
-            "orderList": [
-                {
-                    "txlogisticId": payload["TxlogisticId"],
-                    "billCode": fake_bill,
-                }
-            ],
-        },
-    }
+    # import random
+    # fake_bill = "MOCK" + "".join(random.choices(string.digits, k=11))
+    # return {
+    #     "code": "1",
+    #     "msg": "success",
+    #     "data": {
+    #         "lastCenterName": "DC BAU-SP",
+    #         "sortingCode": "BAU  413-00  002",
+    #         "createOrderTime": "2026-06-05 10:00:00",
+    #         "orderList": [
+    #             {
+    #                 "txlogisticId": payload["TxlogisticId"],
+    #                 "billCode": fake_bill,
+    #             }
+    #         ],
+    #     },
+    # }
     # ── fim do MOCK ──
     
     biz_content_str = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
@@ -309,7 +309,6 @@ def carregar_mapa_bill_code(sucessos: list) -> dict:
 
 def atualizar_tracking_code(subscription_id: str, bill_code: str) -> None:
     sql = 'UPDATE "Subscriptions" SET "TrackingCode" = %(tracking_code)s, "UpdatedAt" = NOW() WHERE "Id" = %(subscription_id)s'
-    print(f"SQL: {sql} {subscription_id}, {bill_code}")
     try:
         conn = psycopg2.connect(host=DB_HOST, port=DB_PORT, dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD)
         try:

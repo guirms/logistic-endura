@@ -225,7 +225,7 @@ def fetch_subscriptions() -> list[dict]:
         LEFT JOIN "Events"     eob ON eob."Id" = kob."EventId"
         WHERE COALESCE(s."UpdatedAt", s."CreatedAt") > %(created_after)s
         AND NOT (a."ZipCode" = '88804600' or a."ZipCode" = '88805090')   
-        AND p."Status" = 1     
+        AND p."Status" = 1 
         ORDER BY s."Id";
     """
     
