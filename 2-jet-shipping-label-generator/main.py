@@ -22,12 +22,12 @@ PRIVATE_KEY   = os.getenv("PRIVATE_KEY")
 CUSTOMER_CODE = os.getenv("CUSTOMER_CODE")
 BODY_DIGEST   = os.getenv("BODY_DIGEST")
 
-URL            = "https://openapi.jtjms-br.com/webopenplatformapi/api/order/addOrder"
+URL            = os.getenv("JET_API_URL") + 'order/addOrder'
 SUCCESS_XMLS = SCRIPT_DIR.parent / "1-sell-invoice-generator" / "success_responses.json"
 PASTA_XMLS = SCRIPT_DIR.parent / "1-sell-invoice-generator" / "xmls"
 INTERVALO_SEG  = 10
 SUCCESS_FILE   = SCRIPT_DIR / "success_responses.json"
-ERROR_FILE     = SCRIPT_DIR / "error_responses.json" 
+ERROR_FILE     = SCRIPT_DIR / "error_responses.json"
 
 DB_HOST     = os.getenv("DB_HOST")
 DB_PORT     = os.getenv("DB_PORT")
@@ -122,7 +122,6 @@ def parsear_xml(caminho: str) -> dict:
     v_prod           = prod.findtext("nfe:vProd", default="0.00", namespaces=NS)
     pesoL_raw        = prod.findtext("nfe:pesoL", default="", namespaces=NS)
 
-    # Normalize weight: use default if missing, convert comma to dot, format to 2 decimals
     if not pesoL_raw:
         pesoL = "0.29"
     else:
@@ -230,7 +229,10 @@ def enviar_pedido(payload: dict) -> dict:
 def carregar_json(caminho: str) -> list:
     if os.path.exists(caminho):
         with open(caminho, "r", encoding="utf-8") as f:
-            return json.load(f)
+            content = f.read().strip()
+            if not content:
+                return []
+            return json.loads(content)
     return []
 
 
@@ -242,25 +244,52 @@ def salvar_json(caminho: str, dados: list) -> None:
 def carregar_chaves_processadas(sucessos: list) -> set:
     return {entry["chNFe"] for entry in sucessos if "chNFe" in entry}
 
+
 def carregar_mapa_subscription(caminho: Path) -> dict:
-    """Monta um dict {chNFe: subscription_id} a partir do success_responses do script 1."""
     if not caminho.exists():
+        print(f"    ⚠️  success_responses.json do script 1 não encontrado em: {caminho}")
         return {}
     try:
-        registros = json.loads(caminho.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
+        content = caminho.read_text(encoding="utf-8").strip()
+        if not content:
+            return {}
+        registros = json.loads(content)
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"    ⚠️  Erro ao ler {caminho}: {e}")
+        return {}
+    if not isinstance(registros, list):
         return {}
     mapa = {}
     for entry in registros:
-        chave_nfe = entry.get("response", {}).get("chave_nfe", "")
+        if not isinstance(entry, dict):
+            continue
+        response = entry.get("response")
+        if not isinstance(response, dict):
+            continue
+        chave_nfe = response.get("chave_nfe", "")
         sub_id = entry.get("subscription_id")
         if chave_nfe and sub_id:
             mapa[chave_nfe.replace("NFe", "")] = sub_id
     return mapa
 
 
+def carregar_mapa_bill_code(sucessos: list) -> dict:
+    """Monta um dict {chNFe: billCode} a partir dos sucessos já registrados localmente."""
+    mapa = {}
+    for entry in sucessos:
+        ch = entry.get("chNFe")
+        try:
+            bill_code = entry["resposta"]["data"]["orderList"][0]["billCode"]
+        except (KeyError, IndexError, TypeError):
+            bill_code = entry.get("bill_code")
+        if ch and bill_code:
+            mapa[ch] = bill_code
+    return mapa
+
+
 def atualizar_tracking_code(subscription_id: str, bill_code: str) -> None:
     sql = 'UPDATE "Subscriptions" SET "TrackingCode" = %(tracking_code)s WHERE "Id" = %(subscription_id)s'
+    print(f"SQL: {sql}")
     try:
         conn = psycopg2.connect(host=DB_HOST, port=DB_PORT, dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD)
         try:
@@ -275,7 +304,22 @@ def atualizar_tracking_code(subscription_id: str, bill_code: str) -> None:
             conn.close()
     except Exception as exc:
         print(f"    ❌ Erro de conexão ao banco para Subscription {subscription_id}: {exc}")
-        
+
+
+def agrupar_por_endereco(todos_dados: list) -> dict:
+    """
+    Agrupa lista de dicts {arquivo, dados} pela chave (PostCode, StreetNumber).
+    Retorna dict {(cep, numero): [lista de {arquivo, dados}]}.
+    """
+    grupos = {}
+    for item in todos_dados:
+        cep    = item["dados"]["dest"]["PostCode"]
+        numero = item["dados"]["dest"]["StreetNumber"]
+        chave  = (cep, numero)
+        grupos.setdefault(chave, []).append(item)
+    return grupos
+
+
 def main():
     arquivos = sorted(glob.glob(os.path.join(PASTA_XMLS, "*.xml")))
     total    = len(arquivos)
@@ -284,90 +328,182 @@ def main():
         print(f"❌ Nenhum XML encontrado na pasta '{PASTA_XMLS}/'")
         return
 
-    sucessos  = carregar_json(SUCCESS_FILE)
-    erros     = carregar_json(ERROR_FILE)
-    ja_feitos = carregar_chaves_processadas(sucessos)
-
-    pendentes = total - len(ja_feitos)
-
-    print(f"\n📋 {total} XMLs encontrados em '{PASTA_XMLS}/'")
-    if ja_feitos:
-        print(f"⏭️  {len(ja_feitos)} já processados anteriormente — serão ignorados")
-    print(f"📬 {pendentes} pedidos a enviar")
-    print(f"⏱  Intervalo entre requisições: {INTERVALO_SEG}s")
-    estimado = pendentes * INTERVALO_SEG
-    print(f"⏳ Tempo estimado: ~{estimado // 60}min {estimado % 60}s\n")
-
-    enviados_agora = 0
-    
+    sucessos          = carregar_json(SUCCESS_FILE)
+    erros             = carregar_json(ERROR_FILE)
+    ja_feitos         = carregar_chaves_processadas(sucessos)
     mapa_subscriptions = carregar_mapa_subscription(SUCCESS_XMLS)
- 
-    for i, caminho in enumerate(arquivos, start=1):
+    mapa_bill_codes   = carregar_mapa_bill_code(sucessos)
+
+    # ── 1. Parsear todos os XMLs ──────────────────────────────────────────────
+    print(f"\n📋 Parseando {total} XMLs...")
+    todos_dados = []
+    for caminho in arquivos:
         nome_arquivo = os.path.basename(caminho)
-        print(f"[{i:>3}/{total}] {nome_arquivo} ...", end=" ", flush=True)
-
-        entrada_log = {"arquivo": nome_arquivo, "timestamp": datetime.now(timezone.utc).isoformat()}
-
         try:
             dados = parsear_xml(caminho)
+            todos_dados.append({"arquivo": nome_arquivo, "caminho": caminho, "dados": dados})
+        except ET.ParseError as e:
+            print(f"❌ XML inválido ({nome_arquivo}): {e}")
+            entrada_log = {
+                "arquivo": nome_arquivo,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "motivo_erro": f"XML inválido: {e}",
+            }
+            erros.append(entrada_log)
+            salvar_json(ERROR_FILE, erros)
+        except Exception as e:
+            print(f"❌ Erro ao parsear ({nome_arquivo}): {e}")
+            entrada_log = {
+                "arquivo": nome_arquivo,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "motivo_erro": f"Erro ao parsear: {e}",
+            }
+            erros.append(entrada_log)
+            salvar_json(ERROR_FILE, erros)
 
-            if dados["chNFe"] in ja_feitos:
-                print(f"⏭️  Já processado (chNFe: {dados['chNFe'][:20]}...) — pulando")
-                continue
-            payload = montar_payload(dados)
-            resposta = enviar_pedido(payload)
+    # ── 2. Agrupar por (CEP, número) ─────────────────────────────────────────
+    grupos = agrupar_por_endereco(todos_dados)
 
-            entrada_log["TxlogisticId"] = payload["TxlogisticId"]
-            entrada_log["chNFe"]        = dados["chNFe"]
-            entrada_log["nNF"]          = dados["nNF"]
-            entrada_log["destinatario"] = dados["dest"]["Name"]
-            entrada_log["resposta"]     = resposta
+    total_grupos   = len(grupos)
+    pendentes_api  = sum(
+        1 for membros in grupos.values()
+        if not all(m["dados"]["chNFe"] in ja_feitos for m in membros)
+        and not any(m["dados"]["chNFe"] in ja_feitos for m in membros)
+    )
 
-            cod = resposta.get("code") or resposta.get("responseCode") or ""
-            msg = resposta.get("message") or resposta.get("responseMessage") or ""
+    print(f"📦 {total_grupos} grupo(s) de endereço identificados")
+    print(f"📬 Grupos que precisarão de chamada à API: {pendentes_api}")
+    print(f"⏱  Intervalo entre requisições: {INTERVALO_SEG}s\n")
 
-            if str(cod) in ("1", "200", "true", "True") or resposta.get("success"):
-                print(f"✅  TxlogisticId: {payload['TxlogisticId']} | NF: {dados['nNF']} | {dados['dest']['Name']}")
+    enviados_agora = 0
 
-                try:
-                    bill_code = resposta["data"]["orderList"][0]["billCode"]
-                    sub_id = mapa_subscriptions.get(dados["chNFe"])
-                    if sub_id:
-                        atualizar_tracking_code(sub_id, bill_code)
-                    else:
-                        print(f"    ⚠️  Subscription não encontrada para chNFe {dados['chNFe'][:20]}...")
-                except (KeyError, IndexError, TypeError) as exc:
-                    print(f"    ⚠️  Não foi possível extrair billCode da resposta: {exc}")
+    for idx_grupo, ((cep, numero), membros) in enumerate(grupos.items(), start=1):
+        ch_membros   = [m["dados"]["chNFe"] for m in membros]
+        ja_proc_mask = [ch in ja_feitos for ch in ch_membros]
+        todos_proc   = all(ja_proc_mask)
+        algum_proc   = any(ja_proc_mask)
 
-                sucessos.append(entrada_log)
-                ja_feitos.add(dados["chNFe"])
-                enviados_agora += 1
-                salvar_json(SUCCESS_FILE, sucessos)
-            else:
-                print(f"⚠️   Resposta inesperada — código: {cod} | mensagem: {msg}")
-                entrada_log["motivo_erro"] = f"código: {cod} | mensagem: {msg}"
+        # ── Caso A: todos já processados ──────────────────────────────────────
+        if todos_proc:
+            print(f"[Grupo {idx_grupo}/{total_grupos}] CEP={cep} nº={numero} — ⏭️  todos já processados")
+            continue
+
+        # ── Determinar o billCode a usar ──────────────────────────────────────
+        bill_code_existente = None
+        pai_dados           = None
+
+        if algum_proc:
+            # Pelo menos um do grupo já tem billCode — reutilizar
+            for ch in ch_membros:
+                if ch in mapa_bill_codes:
+                    bill_code_existente = mapa_bill_codes[ch]
+                    break
+            print(f"[Grupo {idx_grupo}/{total_grupos}] CEP={cep} nº={numero} — ♻️  reuso de billCode existente: {bill_code_existente}")
+        else:
+            # Nenhum processado — eleger o primeiro como pai e chamar a API
+            pai_item  = membros[0]
+            pai_dados = pai_item["dados"]
+            nome_arq  = pai_item["arquivo"]
+            print(f"[Grupo {idx_grupo}/{total_grupos}] CEP={cep} nº={numero} — 🚀 enviando via {nome_arq} ...", end=" ", flush=True)
+
+            entrada_log = {
+                "arquivo":    nome_arq,
+                "timestamp":  datetime.now(timezone.utc).isoformat(),
+                "chNFe":      pai_dados["chNFe"],
+                "nNF":        pai_dados["nNF"],
+                "destinatario": pai_dados["dest"]["Name"],
+            }
+
+            try:
+                payload  = montar_payload(pai_dados)
+                resposta = enviar_pedido(payload)
+
+                entrada_log["TxlogisticId"] = payload["TxlogisticId"]
+                entrada_log["resposta"]     = resposta
+
+                cod = resposta.get("code") or resposta.get("responseCode") or ""
+                msg = resposta.get("message") or resposta.get("responseMessage") or ""
+
+                if str(cod) in ("1", "200", "true", "True") or resposta.get("success"):
+                    try:
+                        bill_code_existente = resposta["data"]["orderList"][0]["billCode"]
+                    except (KeyError, IndexError, TypeError) as exc:
+                        print(f"\n    ⚠️  Não foi possível extrair billCode da resposta: {exc}")
+
+                    print(f"✅  TxlogisticId: {payload['TxlogisticId']} | NF: {pai_dados['nNF']} | {pai_dados['dest']['Name']}")
+
+                    sucessos.append(entrada_log)
+                    ja_feitos.add(pai_dados["chNFe"])
+                    if bill_code_existente:
+                        mapa_bill_codes[pai_dados["chNFe"]] = bill_code_existente
+                    enviados_agora += 1
+                    salvar_json(SUCCESS_FILE, sucessos)
+                else:
+                    print(f"⚠️   Resposta inesperada — código: {cod} | mensagem: {msg}")
+                    entrada_log["motivo_erro"] = f"código: {cod} | mensagem: {msg}"
+                    erros.append(entrada_log)
+                    salvar_json(ERROR_FILE, erros)
+                    # Sem billCode, não há como atualizar o grupo — pular
+                    if idx_grupo < total_grupos:
+                        time.sleep(INTERVALO_SEG)
+                    continue
+
+            except requests.exceptions.RequestException as e:
+                print(f"❌ Erro de rede — {e}")
+                entrada_log["motivo_erro"] = f"Erro de rede: {e}"
                 erros.append(entrada_log)
                 salvar_json(ERROR_FILE, erros)
+                if idx_grupo < total_grupos:
+                    time.sleep(INTERVALO_SEG)
+                continue
 
-        except ET.ParseError as e:
-            print(f"❌ XML inválido — {e}")
-            entrada_log["motivo_erro"] = f"XML inválido: {e}"
-            erros.append(entrada_log)
-            salvar_json(ERROR_FILE, erros)
+            except Exception as e:
+                print(f"❌ Erro inesperado — {e}")
+                entrada_log["motivo_erro"] = f"Erro inesperado: {e}"
+                erros.append(entrada_log)
+                salvar_json(ERROR_FILE, erros)
+                if idx_grupo < total_grupos:
+                    time.sleep(INTERVALO_SEG)
+                continue
 
-        except requests.exceptions.RequestException as e:
-            print(f"❌ Erro de rede — {e}")
-            entrada_log["motivo_erro"] = f"Erro de rede: {e}"
-            erros.append(entrada_log)
-            salvar_json(ERROR_FILE, erros)
+        # ── Atualizar banco e registrar duplicatas ────────────────────────────
+        if not bill_code_existente:
+            print(f"    ⚠️  billCode indisponível para o grupo CEP={cep} nº={numero} — banco não atualizado")
+            if idx_grupo < total_grupos:
+                time.sleep(INTERVALO_SEG)
+            continue
 
-        except Exception as e:
-            print(f"❌ Erro inesperado — {e}")
-            entrada_log["motivo_erro"] = f"Erro inesperado: {e}"
-            erros.append(entrada_log)
-            salvar_json(ERROR_FILE, erros)
+        for membro in membros:
+            ch = membro["dados"]["chNFe"]
 
-        if i < total:
+            if ch in ja_feitos and not algum_proc:
+                # Já tratado acima como pai — pular registro duplicado
+                continue
+
+            sub_id = mapa_subscriptions.get(ch)
+            if sub_id:
+                atualizar_tracking_code(sub_id, bill_code_existente)
+            else:
+                print(f"    ⚠️  Subscription não encontrada para chNFe {ch[:20]}...")
+
+            # Registrar duplicatas de endereço no success_responses
+            if ch not in ja_feitos:
+                entrada_dup = {
+                    "arquivo":           membro["arquivo"],
+                    "timestamp":         datetime.now(timezone.utc).isoformat(),
+                    "chNFe":             ch,
+                    "nNF":               membro["dados"]["nNF"],
+                    "destinatario":      membro["dados"]["dest"]["Name"],
+                    "bill_code":         bill_code_existente,
+                    "duplicata_endereco": True,
+                }
+                sucessos.append(entrada_dup)
+                ja_feitos.add(ch)
+                mapa_bill_codes[ch] = bill_code_existente
+                salvar_json(SUCCESS_FILE, sucessos)
+                print(f"    📎 Duplicata registrada: {membro['arquivo']} → billCode {bill_code_existente}")
+
+        if idx_grupo < total_grupos:
             time.sleep(INTERVALO_SEG)
 
     print(f"\n✅ Concluído! {len(sucessos)} sucessos no total ({enviados_agora} nesta execução), {len(erros)} erros.")
